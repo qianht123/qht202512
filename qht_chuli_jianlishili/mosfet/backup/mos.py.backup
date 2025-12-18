@@ -1,0 +1,878 @@
+import gdspy
+import os
+try:
+    from .basic import basic
+except ImportError:
+    from basic import basic
+try:
+    from .glovar import tsmc40_glovar as glovar
+except ImportError:
+    from glovar import tsmc40_glovar as glovar
+try:
+    from .Pin import Pin
+except ImportError:
+    from Pin import Pin
+
+# Standard Rules from glovar.py
+min_w = glovar.min_w
+layer = glovar.layer
+sp = glovar.sp
+en = glovar.en
+ex = glovar.ex
+NWELL_GR = glovar.NWELL_GR
+NW_OD = glovar.NW_OD
+NP_OD = glovar.NP_OD
+OD_W = glovar.OD_W
+GRID = glovar.GRID
+SUB_GR = glovar.SUB_GR
+KR_SP = glovar.KR_SP
+OD_TOP = glovar.OD_TOP
+C_M2 = glovar.C_M2
+M2_M1 = glovar.M2_M1
+VTL_P_LEFT = glovar.VTL_P_LEFT
+
+# Special rulse related with gate spacing
+dummy_l = 0.06 #critical length for dummy poly
+crit_l = 0.12 #critical length for poly that require additional spacing 
+crit_sp = 0.16 #critical additional spacing for PO
+
+# Special rules for OD_25 related rules
+gate_space_25 = 0.22
+sp_co_po_25 = 0.08
+en_od_25 = 0.2  # Enclosue rule of OD_25 and OD layer
+
+# Special rules for NT_N related rules
+ex_po_od_na = 0.35
+
+class Mosfet:
+# Currently supported Mosfet types: nch, pch
+# Supported attribute keywords: od25, ud, od, na, lvt, hvt, mac
+# Note: na devices should only be compatible with nch
+# Unsupported attributes: x, dnw, hv25, snw, na25
+# GATE Connection metal check legalization if min_w['M1'] not 0.07
+    def __init__(self, nch, name, w, l, nf, attr=[], spectre=False, pinConType=None, bulkCon=[]):
+        self.nmos = nch
+        self.name = name
+        if spectre:
+            self.w = w/nf
+        else:
+            self.w = w 
+        self.l = l
+        self.nf = nf
+        self.od25 = False
+        self.ud18 = False
+        self.od33 = False
+        self.drain = Pin('D')
+        self.gate = Pin('G')
+        self.source = Pin('S')
+        self.bulk = Pin('B')
+        self.cell = gdspy.Cell(name, True)
+        if '25' in attr:
+            sp_co_po = sp['CO']['PO']
+            self.od25 = True
+            sp['CO']['PO'] = sp_co_po_25
+        if 'ud' in attr:
+            self.ud18 = True
+        if 'od' in attr:
+            self.od33 = True
+        if 'na' in attr:
+            ex_po_od = ex['PO']['OD']
+            ex['PO']['OD'] = ex_po_od_na
+        self.mos_core()
+        self.doping_layer()
+        if 'lvt' in attr:
+            self.vth_layer(True)
+        if 'hvt' in attr:
+            self.vth_layer(False)
+        if 'mac' in attr:
+            self.mac_layer()
+        if 'na' in attr:
+            self.na_layer()
+            ex['PO']['OD'] = ex_po_od
+        if '25' in attr:
+            self.od25_layer()
+            sp['CO']['PO'] = sp_co_po
+        self.bulkCon = bulkCon
+        self.nwell_gr()
+        self.connect_pin(pinConType)
+        self.connect_pin_bulk()
+        self.flatten()
+        self.print_pins()
+
+    def safe_name(s):
+        import re
+        return re.sub(r'[^A-Za-z0-9_\-]', '_', str(s))
+    @staticmethod
+    def inspect_cell(cell):
+        """
+        打印 cell 内部结构摘要，返回有用信息字典。
+        """
+        print("=== inspect_cell ===")
+        print("cell.name:", getattr(cell, "name", None))
+        try:
+            polys_nonrec = cell.get_polygons(False)  # non-recursive
+            # polys_nonrec is a list-of-lists in some gdspy versions
+            n_polys = 0
+            if isinstance(polys_nonrec, list):
+                for p in polys_nonrec:
+                    n_polys += len(p)
+            else:
+                n_polys = len(polys_nonrec)
+            print("polygons in this cell (non-recursive):", n_polys)
+        except Exception as e:
+            print("get_polygons(non-recursive) error:", e)
+
+        try:
+            byspec = cell.get_polygons(by_spec=True, depth=0)
+            print("polygons by spec (non-recursive) keys:", list(byspec.keys()))
+        except Exception as e:
+            print("get_polygons(by_spec) error:", e)
+
+        try:
+            refs = getattr(cell, "references", None)
+            print("cell.references attribute:", bool(refs), "len:", len(refs) if refs else 0)
+        except Exception as e:
+            print("references access error:", e)
+
+        try:
+            deps = cell.get_dependencies(recursive=True)
+            dep_names = []
+            for d in deps:
+                dep_names.append(getattr(d, "name", str(d)))
+            print("dependencies (recursive):", dep_names)
+        except Exception as e:
+            print("get_dependencies error:", e)
+
+        try:
+            bb = cell.get_bounding_box()
+            print("bounding_box:", bb)
+        except Exception as e:
+            print("get_bounding_box error:", e)
+        print("====================")
+    @staticmethod
+    def snapshot_with_deps(cell, step_name, outdir="gds_snapshots", unit=1.0e-6, precision=1.0e-9):
+        """
+        把 cell 及其所有依赖的子 cell 一并写入 GDS。
+        也会打印一些摘要信息，避免“只有部分内容”。
+        """
+        os.makedirs(outdir, exist_ok=True)
+        safe_step = Mosfet.safe_name(step_name)
+        cell_name = getattr(cell, "name", "cell")
+        
+        filename = f"{cell_name}_{safe_step}.gds"
+        fullpath = os.path.join(outdir, filename)
+
+        lib = gdspy.GdsLibrary()
+        try:
+            # lib.add(cell) 通常能把依赖也加入；为了保险，把依赖显式加入
+            lib.add(cell)
+            deps = cell.get_dependencies(recursive=True)
+            for d in deps:
+                try:
+                    lib.add(d)
+                except Exception:
+                    # 有时 get_dependencies 返回名字或对象混合，忽略异常
+                    pass
+            lib.write_gds(fullpath, unit=unit, precision=precision)
+            print(f"[snapshot_with_deps] wrote {fullpath} (cells in lib: {len(lib.cells)})")
+        except Exception as e:
+            print("[snapshot_with_deps] error writing:", e)
+            # fallback: try gdspy.write_gds with explicit list
+            try:
+                all_cells = [cell] + list(cell.get_dependencies(recursive=True))
+                gdspy.write_gds(fullpath, all_cells, unit=unit, precision=precision)
+                print(f"[snapshot_with_deps] fallback wrote {fullpath}")
+            except Exception as e2:
+                print("[snapshot_with_deps] fallback error:", e2)
+
+        return fullpath
+
+    def snapshot_gds(self, cell, step_name, outdir="gds_snapshots", unit=1.0e-6, precision=1.0e-9):
+        """    保存当前 cell 的到 GDS
+        :param cell: gdspy.Cell 对象
+        :param step_name: 当前步骤名字
+        :param outdir: 目录    """
+        os.makedirs(outdir, exist_ok=True)
+        filename = os.path.join(outdir, f"{cell.name}_{step_name}.gds")
+        gdspy.write_gds(filename, [cell], unit=unit, precision=precision)
+        print(f"[Snapshot] {filename} 已保存")
+
+    def pin(self):
+        # TODO Future version should include all shapes
+        if not self.nmos and NWELL_GR:
+            return [self.drain, self.gate, self.source, self.bulk]
+        else:
+            return [self.drain, self.gate, self.source]
+       
+    def flatten(self):
+        if self.origin:
+            self.origin = [self.origin[0] + 0.5*min_w['M1'], self.origin[1] + 0.5 * min_w['M1']]
+            temp = gdspy.CellReference(self.cell, (-self.origin[0],-self.origin[1]))
+            self.cell = gdspy.Cell(self.name, True)
+            self.cell.add(temp)
+            self.drain.adjust(self.origin)
+            self.gate.adjust(self.origin)
+            self.source.adjust(self.origin)
+            self.bulk.adjust(self.origin)
+            self.origin = None
+        self.cell.flatten()
+
+# Compatible with gdspy
+    def to_gds(self, multiplier):
+        #self.flatten()
+        return self.cell.to_gds(multiplier)
+
+    def vth_layer(self, lvt):
+        if lvt:
+            if self.nmos:
+                vth_layer = layer['VTL_N']
+            else:
+                vth_layer = layer['VTL_P']
+        else:
+            if self.nmos:
+                vth_layer = layer['VTH_N']
+            else:
+                vth_layer = layer['VTH_P']
+        vth_shape = gdspy.Rectangle((self.nw_ll[0]-VTL_P_LEFT,self.nw_ll[1]), self.nw_ur, vth_layer)
+        print(f"Creating wth shape rectangle: bottom_left={self.nw_ll}, top_right={self.nw_ur}, layer={vth_layer}")
+        self.cell.add(vth_shape)
+        #self.flatten()    
+    
+    def mac_layer(self):
+        mac_shape = gdspy.Rectangle(self.nw_ll, self.nw_ur, layer['LVSDMY'], datatype=1)
+        print(f"Creating mac shape rectangle: bottom_left={self.nw_ll}, top_right={self.nw_ur}, layer={layer['LVSDMY']}, datatype=1")
+
+        self.cell.add(mac_shape)
+        #self.flatten()
+
+    def od25_layer(self):
+        od25_p1 = [self.x_od1-en_od_25, -en_od_25]
+        od25_p2 = [self.x_od2+en_od_25, self.w+en_od_25]
+        od25_shape = gdspy.Rectangle(od25_p1, od25_p2, layer['OD_25'])
+        print(f"Creating od25layer  rectangle: bottom_left={od25_p1}, top_right={od25_p2}, layer={layer['OD_25']}")
+        self.cell.add(od25_shape)
+        if self.ud18:
+            od_25ud_shape = gdspy.Rectangle(od25_p1, od25_p2, layer['OD_25'], datatype=4)
+            print(f"Creating ud18 rectangle: bottom_left={od25_p1}, top_right={od25_p2}, layer={layer['OD_25']}, datatype=4")
+
+            self.cell.add(od_25ud_shape)
+        elif self.od33:
+            od_25od_shape = gdspy.Rectangle(od25_p1, od25_p2, layer['OD_25'], datatype=3)
+            print(f"Creating od33 rectangle: bottom_left={od25_p1}, top_right={od25_p2}, layer={layer['OD_25']}, datatype=3")
+
+            self.cell.add(od_25od_shape)
+        #self.flatten()
+
+    def na_layer(self):
+        na_p1 = [self.x_od1-en['NT_N']['OD'], -en['NT_N']['OD']]
+        na_p2 = [self.x_od2+en['NT_N']['OD'], self.w+en['NT_N']['OD']]
+        na_shape = gdspy.Rectangle(na_p1, na_p2, layer['NT_N'])   
+        print(f"Creating na_shape rectangle: bottom_left={na_p1}, top_right={na_p2}, layer={layer['NT_N']}")
+ 
+        self.cell.add(na_shape)
+        #self.flatten()
+
+    def mos_core(self):
+        self.nf_change = False
+    ### Source Drain Metal Contact
+        #contact_num = None
+        m1_cell = basic.metal_vert(min_w['M1'], self.w)
+        m1_y_legal = -basic.legal_len(self.w) + self.w
+        m1_legal_shape = gdspy.Rectangle((0,0), (min_w['M1'], self.w), layer['M1'])
+        print(f"Creating rectangle (m1_legal_shape): bottom_left={(0,0)}, top_right={(min_w['M1'], self.w)}, layer={layer['M1']}")
+
+        m1_cell.add(m1_legal_shape)
+        m1_cell_space = basic.legal(self.l + 2 * sp['CO']['PO'])
+        if self.l > crit_l: #handling special rule 
+            m1_cell_space = basic.legal(crit_sp + self.l)
+        if self.od25:
+            m1_cell_space =  basic.legal(gate_space_25 + self.l)
+        m1_array_offset = self.l + 0.5*(m1_cell_space - self.l - min_w['M1']) - m1_cell_space
+        m1_array = gdspy.CellArray(m1_cell, (self.nf+1), 1, [m1_cell_space, 0], [m1_array_offset, 0])
+        print(f"Creating CellArray (m1_array): bottom_left=({m1_array_offset}, 0), spacing=({m1_cell_space}, 0), columns={self.nf+1}, rows=1")
+        self.cell.add(m1_array)
+        self.origin = [m1_array_offset, m1_y_legal]
+    ### Gate Poly
+        gate_cell = gdspy.Cell('GATE', True)
+        gate_shape = gdspy.Rectangle((0, -ex['PO']['OD']), (self.l, self.w+ex['PO']['OD']), layer['PO'])
+        print(f"Creating rectangle (gate_shape): bottom_left={(0, -ex['PO']['OD'])}, top_right={(self.l, self.w+ex['PO']['OD'])}, layer={layer['PO']}")
+        gate_cell.add(gate_shape)
+        self.gate_space = m1_cell_space
+        gate_array = gdspy.CellArray(gate_cell, self.nf, 1, [self.gate_space, 0])
+        print(f"Creating CellArray (gate_array): bottom_left={(0,0)}, spacing=({self.gate_space}, 0), columns={self.nf}, rows=1")
+        self.cell.add(gate_array)
+    
+    ### OD Layer
+    ###20250811 change
+        '''od_cell = gdspy.Cell('OD',True)
+        if contact_num > 0:
+            od_width = max( min_w['OD'], min_w['CO'] + 2 * en['OD']['CO'])
+        else:
+            od_width = min_w['OD'] + 2 * en['OD']['CO']
+        od_shape = gdspy.Rectangle((m1_array_offset + self.gate_space, 0), (od_width, self.w), layer['OD']) ###?
+        od_cell.add(od_shape)
+        od_num = None
+        if self.nf % 2 == 1 :
+            od_num = self.nf // 2
+        else : 
+            od_num = (self.nf + 1) // 2
+        od_array = gdspy.CellArray(od_cell, od_num, 1, [self.gate_space, 0])
+        self.cell.add(od_array)'''
+
+        self.x_od1 = -(self.gate_space - min_w['M1'] - self.l)/2 - min_w['CO'] - 0.5*(min_w['M1'] - min_w['CO']) - en['OD']['CO']-self.gate_space
+        if self.nf % 2 == 0 or self.nf == 1:
+            self.x_od2 = (self.nf-1)*self.gate_space + self.l - self.x_od1
+            od_shape = gdspy.Rectangle((self.x_od1, 0), (self.x_od2, self.w), layer['OD'])
+            print(f"Creating rectangle (od_shape, even/1): bottom_left=({self.x_od1}, 0), top_right=({self.x_od2}, {self.w}), layer={layer['OD']}")
+        else:
+            self.x_od2 = self.nf*self.gate_space + self.l - self.x_od1
+            od_shape = gdspy.Rectangle((self.x_od1, 0), (self.x_od2+ - self.gate_space, self.w), layer['OD'])
+            print(f"Creating rectangle (od_shape, odd): bottom_left=({self.x_od1}, 0), top_right=({self.x_od2 - self.gate_space}, {self.w}), layer={layer['OD']}")
+        self.cell.add(od_shape)
+        self.snapshot_gds(self.cell, "step1_core")
+    ### GATE Connection
+        # Single Finger, no need to connect source/drain
+        if self.nf == 1: 
+            # Gate Contact
+            width = min_w['CO'] + 2 * en['M1']['CO']
+            self.gate_ext_len = min_w['SP']
+            #self.gate_ext_len = basic.legal(ex['PO']['OD'] + 0.5 * (min_w['CO'] + 2*en['PO']['CO'] - min_w['M1'])) - min_w['M1']
+            if width >= self.l:
+                x_pos = 0.5*(width-self.l) 
+                y_pos = self.w + self.gate_ext_len - 0.5 * (min_w['CO'] + 2*en['PO']['CO'] - min_w['M1'])
+                # TODO: increase PO_W for potential DRC violations here
+                gate_con_shape = gdspy.Rectangle((-x_pos, y_pos), (-x_pos+width, y_pos+min_w['CO']+2*en['PO']['CO']), layer['PO'])
+                self.cell.add(gate_con_shape)
+                # Legalization added con_shape
+                gate_con_shape = gdspy.Rectangle((0, self.w), (self.l, y_pos), layer['PO'])
+                self.cell.add(gate_con_shape)
+                # Legalization for top metal
+                y_pos = y_pos + en['PO']['CO']-0.5*(min_w['M1']-min_w['CO'])
+                #x_pos_legal1 = basic.legal_coord((-x_pos, y_pos),self.origin,1)[0]
+                #x_pos_legal2 = basic.legal_coord((-x_pos+width, y_pos+min_w['M1']),self.origin,3)[0]
+                x_pos_legal1 = m1_array_offset
+                x_pos_legal2 = m1_array_offset + self.gate_space 
+                gate_m1_shape = gdspy.Rectangle((x_pos_legal1, y_pos),(x_pos_legal2+min_w['M1'], y_pos+min_w['M1']), layer['M1'])
+                self.cell.add(gate_m1_shape)
+                x_pos = -x_pos + 0.5*(width-min_w['CO'])
+                y_pos = y_pos + 0.5*(min_w['M1']-min_w['CO'])
+                gate_co_shape = gdspy.Rectangle((x_pos, y_pos), (x_pos+min_w['CO'], y_pos+min_w['CO']), layer['CO'])
+                self.cell.add(gate_co_shape)
+                # Adding Pin:G
+                self.gate.add_shape('M1', gate_m1_shape.get_bounding_box())
+            else:
+                y_pos = self.w + self.gate_ext_len + 0.5*(min_w['M1']+min_w['CO']) + en['PO']['CO']
+                gate_con_shape = gdspy.Rectangle((0, self.w), (self.l, y_pos), layer['PO'])
+                self.cell.add(gate_con_shape)
+                y_pos = self.w + self.gate_ext_len
+                m1_gate = basic.metal_hori(self.l, min_w['M1'])
+                m1_gate_ref = gdspy.CellReference(m1_gate, (0, y_pos))
+                self.cell.add(m1_gate_ref)
+                # Legalization M1
+                x_pos_legal1 = m1_array_offset
+                x_pos_legal2 = m1_array_offset + self.gate_space 
+                gate_m1_shape = gdspy.Rectangle((x_pos_legal1, y_pos),(x_pos_legal2+min_w['M1'], y_pos+min_w['M1']), layer['M1'])
+                self.cell.add(gate_m1_shape)
+                # Adding Pin:G
+                self.gate.add_shape('M1', gate_m1_shape.get_bounding_box())
+        # Multiple Finger, need to connect source/drain
+        else:
+        ### this part first (min>= 4 for rfmos)
+        ###------------------------------
+        #--------------------------first-----------------
+            # Source/Drain M1 Conection
+            # KR_SP feature has been removed
+            #assert KR_SP == 0, "KR_SP FEATURE HAS BEEN REMOVED"
+            # Gate Connection
+            '''gate_extension = gdspy.Cell('GATE_EXT', True)
+            gate_extension_bottom = gdspy.Cell('GATE_EXT_BOTTOM',True)
+            # Modified for legal
+            self.gate_ext_len = 2 * min_w['SP'] + min_w['M1']#+ 1 * sp['M1']['M1'] + KR_SP
+            if ex['PO']['OD'] > self.gate_ext_len:  # Handling nch_na devices
+                self.gate_ext_len = basic.legal(ex['PO']['OD'] - (min_w['CO'] + 2*en['PO']['CO'])) + min_w['M1']#+ 0.5 * (min_w['CO'] + 2*en['PO']['CO'] - min_w['M1']) + KR_SP) - min_w['M1']
+            # REMOVED ELSE CLAUSE
+            #else: # Need to extend gate shape
+            #y_pos = self.w + self.gate_ext_len - ( en['PO']['CO'] - 0.5 * ( min_w['M1'] - min_w['CO'] ) )
+
+
+            gate_ext_shape = gdspy.Rectangle((0, self.w), (self.l, self.w +self.gate_ext_len+ 2*min_w['CO'] + sp['CO']['CO']+2*en['PO']['CO']), layer['PO'])
+            gate_extension.add(gate_ext_shape)
+            gate_extension_array = gdspy.CellArray(gate_extension, self.nf, 1, [self.gate_space, self.gate_space])
+            self.cell.add(gate_extension_array)
+            gate_ext_shape_bottom = gdspy.Rectangle((0, -ex['PO']['OD']-self.gate_ext_len- 2*min_w['CO']-sp['CO']['CO']-2*en['PO']['CO']), (self.l, -ex['PO']['OD']), layer['PO'])
+            gate_extension_bottom.add(gate_ext_shape_bottom)
+            gate_ext_shape_bottom_array = gdspy.CellArray(gate_extension_bottom, self.nf, 1, [self.gate_space, self.gate_space])
+            self.cell.add(gate_ext_shape_bottom_array)
+            print(f"Creating rectangle (gate_ext_shape top): bottom_left={(0, self.w)}, top_right={(self.l, self.w + self.gate_ext_len + 2*min_w['CO'] + sp['CO']['CO'] + 2*en['PO']['CO'])}, layer={layer['PO']}")
+            print(f"Creating CellArray (gate_extension_array): bottom_left={(0,0)}, spacing=({self.gate_space}, {self.gate_space}), columns={self.nf}, rows=1")
+
+            print(f"Creating rectangle (gate_ext_shape_bottom): bottom_left={(0, -ex['PO']['OD'] - self.gate_ext_len - 2*min_w['CO'] - sp['CO']['CO'] - 2*en['PO']['CO'])}, top_right={(self.l, -ex['PO']['OD'])}, layer={layer['PO']}")
+            print(f"Creating CellArray (gate_ext_shape_bottom_array): bottom_left={(0,0)}, spacing=({self.gate_space}, {self.gate_space}), columns={self.nf}, rows=1")
+
+            #end else
+            
+            #gate_hori_shape = gdspy.Rectangle((0, y_pos), (self.gate_space*(self.nf-1)+self.l, y_pos+min_w['CO']+2*en['PO']['CO']), layer['PO'])
+            #self.cell.add(gate_hori_shape)
+            gate_contact = basic.metal_hori_poly(min_w['M1'],2*min_w['CO'] + sp['CO']['CO'] + 2*en['PO']['CO'] , self.nf , self.gate_space,2*ex['PO']['OD']+self.w )
+            gate_contact_ref = gdspy.CellReference(gate_contact, (0, self.w+self.gate_ext_len))
+            print(f"Creating CellReference (gate_contact_ref): origin={(0, self.w+self.gate_ext_len)}")
+
+            self.cell.add(gate_contact_ref)
+            # Generate symmetry source connections
+            # self.nf changes here!!!
+            if self.nf % 2 == 1:
+                self.nf_change = True
+                self.nf += 1
+                m1_dummy_x = m1_array_offset + m1_cell_space * self.nf
+                m1_dummy_source = gdspy.Rectangle((m1_dummy_x, m1_y_legal), (m1_dummy_x+min_w['M1'],self.w), layer['M2'])
+                print(f"Creating rectangle (m1_dummy_source): bottom_left=({m1_dummy_x}, {m1_y_legal}), top_right=({m1_dummy_x+min_w['M1']}, {self.w}), layer={layer['M2']}")
+
+                self.cell.add(m1_dummy_source)
+            #m1_square = gdspy.Cell('M1_SQUARE', True)
+            #m1_sq_shape = gdspy.Rectangle((0, -KR_SP), (min_w['M1'], KR_SP+min_w['SP']), layer['M1'])
+            #m1_square.add(m1_sq_shape)
+            source_count = int(self.nf/2+1)
+            drain_count = int((self.nf+1)/2)
+            #m1_source = gdspy.CellArray(m1_square, source_count, 1, [2*self.gate_space, self.gate_space], [m1_array_offset, self.w])
+            #m1_drain = gdspy.CellArray(m1_square, drain_count, 1, [2*self.gate_space, self.gate_space], [m1_array_offset+self.gate_space, -min_w['SP']+self.origin[1]])
+            #m1_source_hori = gdspy.Rectangle((m1_array_offset, self.w+KR_SP+min_w['SP']), 
+            #    (m1_array_offset+(2*source_count-2)*self.gate_space+min_w['M1'], self.w+KR_SP+min_w['SP']+min_w['M1']), layer['M1'])
+            #m1_drain_hori = gdspy.Rectangle((m1_array_offset+self.gate_space, self.origin[1]-min_w['SP']-min_w['M1']), 
+            #    (m1_array_offset+(2*drain_count-1)*self.gate_space+min_w['M1'], self.origin[1]-min_w['SP']), layer['M1'])
+            #self.cell.add(m1_source)
+            #self.cell.add(m1_source_hori)
+            #if drain_count > 1:
+            #    self.cell.add(m1_drain)
+            #    self.cell.add(m1_drain_hori)
+            # Legalization M1 Gate
+            y_pos = self.w + self.gate_ext_len
+            x_pos_legal1 = m1_array_offset
+            x_pos_legal2 = m1_array_offset + self.nf*self.gate_space 
+            y_pos_2 = y_pos + 2*min_w['CO'] + sp['CO']['CO'] + 2*en['PO']['CO']
+            gate_m1_shape = gdspy.Rectangle((x_pos_legal1+0.5*self.gate_space, y_pos+en['PO']['CO']),(x_pos_legal2+min_w['M1']+self.gate_space+1.5*self.gate_space, y_pos_2+en['PO']['CO']), layer['M1'])
+            self.cell.add(gate_m1_shape)
+            gate_m1_shape_bottom = gdspy.Rectangle((x_pos_legal1+0.5*self.gate_space, -self.gate_ext_len-en['PO']['CO']-y_pos_2+y_pos),(x_pos_legal2+min_w['M1']+self.gate_space+1.5*self.gate_space, -self.gate_ext_len-en['PO']['CO']), layer['M1'])
+            self.cell.add(gate_m1_shape_bottom)
+
+            print(f"Creating rectangle (gate_m1_shape top): bottom_left=({x_pos_legal1+0.5*self.gate_space}, {y_pos+en['PO']['CO']}), top_right=({x_pos_legal2+min_w['M1']+self.gate_space+1.5*self.gate_space}, {y_pos_2+en['PO']['CO']}), layer={layer['M1']}")
+
+            print(f"Creating rectangle (gate_m1_shape_bottom): bottom_left=({x_pos_legal1+0.5*self.gate_space}, {-self.gate_ext_len-en['PO']['CO']-y_pos_2+y_pos}), top_right=({x_pos_legal2+min_w['M1']+self.gate_space+1.5*self.gate_space}, {-self.gate_ext_len-en['PO']['CO']}), layer={layer['M1']}")
+'''
+            assert KR_SP == 0, "KR_SP FEATURE HAS BEEN REMOVED"
+            # Gate Connection
+            gate_extension = gdspy.Cell('GATE_EXT', True)
+            gate_extension_bottom = gdspy.Cell('GATE_EXT_BOTTOM', True)
+            gate_extension_1 = gdspy.Cell('GATE_EXT_1', True)
+            gate_extension_bottom_1 = gdspy.Cell('GATE_EXT_BOTTOM_1', True)
+
+            # Modified for legal
+            self.gate_ext_len = 2 * min_w['SP'] + min_w['M1']
+            if ex['PO']['OD'] > self.gate_ext_len:  # Handling nch_na devices
+                self.gate_ext_len = basic.legal(ex['PO']['OD'] - (min_w['CO'] + 2*en['PO']['CO'])) + min_w['M1']
+
+            # ======================
+            # Unified extension length (top/bottom 对称)
+            # ======================
+            ext_len_total = self.gate_ext_len + 2*min_w['CO'] + sp['CO']['CO'] + 2*en['PO']['CO']
+
+            # ----------------------
+            # Top Gate Poly
+            # ----------------------
+            gate_ext_shape = gdspy.Rectangle(
+                (0, self.w),
+                (self.l, self.w + ext_len_total),
+                layer['PO']
+            )
+            gate_extension.add(gate_ext_shape)
+            gate_extension_array = gdspy.CellArray(gate_extension, self.nf, 1, [self.gate_space, self.gate_space])
+            self.cell.add(gate_extension_array)
+
+            # ----------------------
+            # Bottom Gate Poly (对称)
+            # ----------------------
+            gate_ext_shape_bottom = gdspy.Rectangle(
+                (0,  - ext_len_total),
+                (self.l, 0),
+                layer['PO']
+            )
+            gate_extension_bottom.add(gate_ext_shape_bottom)
+            gate_ext_shape_bottom_array = gdspy.CellArray(gate_extension_bottom, self.nf, 1, [self.gate_space, self.gate_space])
+            self.cell.add(gate_ext_shape_bottom_array)
+
+            print(f"Creating rectangle (gate_ext_shape top): bottom_left={(0, self.w)}, top_right={(self.l, self.w + ext_len_total)}, layer={layer['PO']}")
+            print(f"Creating CellArray (gate_extension_array): spacing=({self.gate_space}, {self.gate_space}), columns={self.nf}, rows=1")
+            print(f"Creating rectangle (gate_ext_shape_bottom): bottom_left={(0, -ex['PO']['OD'] - ext_len_total)}, top_right={(self.l, -ex['PO']['OD'])}, layer={layer['PO']}")
+            print(f"Creating CellArray (gate_ext_shape_bottom_array): spacing=({self.gate_space}, {self.gate_space}), columns={self.nf}, rows=1")
+
+            # ----------------------
+            # Gate Contact
+            # ----------------------
+            gate_contact , co_top , co_bottom , co_top_bottom , co_bottom_top = basic.metal_hori_poly(
+                min_w['M1'],
+                2*min_w['CO'] + sp['CO']['CO'] + 2*en['PO']['CO'],
+                self.nf,
+                self.gate_space,
+                2*ex['PO']['OD'] + self.w
+            )
+            offset_for_poly_co_drc = self.w +self.gate_ext_len
+            gate_contact_ref = gdspy.CellReference(gate_contact, (0, self.w+self.gate_ext_len))
+            self.cell.add(gate_contact_ref)
+            print(f"Creating CellReference (gate_contact_ref): origin={(0, self.w+self.gate_ext_len)}")
+            gate_ext_shape_1 = gdspy.Rectangle(
+                (0, self.w + ext_len_total),
+                (self.l, co_top+min_w['OD']+offset_for_poly_co_drc),
+                layer['PO']
+            )
+            gate_extension_1.add(gate_ext_shape_1)
+            gate_extension_array_1 = gdspy.CellArray(gate_extension_1, self.nf, 1, [self.gate_space, self.gate_space])
+            self.cell.add(gate_extension_array_1)
+
+            # ----------------------
+            # Bottom Gate Poly (对称)
+            # ----------------------
+            gate_ext_shape_bottom_1 = gdspy.Rectangle(
+                (0,  co_bottom-min_w['OD']+offset_for_poly_co_drc),
+                (self.l, - ext_len_total),
+                layer['PO']
+            )
+            gate_extension_bottom_1.add(gate_ext_shape_bottom_1)
+            gate_ext_shape_bottom_array_1 = gdspy.CellArray(gate_extension_bottom_1, self.nf, 1, [self.gate_space, self.gate_space])
+            self.cell.add(gate_ext_shape_bottom_array_1)
+
+            # ----------------------
+            # Gate M1 (top & bottom 对称)
+            # ----------------------
+            y_pos = self.w + self.gate_ext_len
+            y_pos_2 = y_pos + 2*min_w['CO'] + sp['CO']['CO'] + 2*en['PO']['CO']
+            x_pos_legal1 = m1_array_offset
+            x_pos_legal2 = m1_array_offset + self.nf*self.gate_space 
+
+            # Top M1
+            gate_m1_shape = gdspy.Rectangle(
+                (-0.5*(min_w['CO']-self.l)-3*en['OD']['CO'], co_top_bottom-3*en['PO']['CO']+offset_for_poly_co_drc),
+                (x_pos_legal2+min_w['M1']+2.5*self.gate_space, co_top+3*en['PO']['CO']+offset_for_poly_co_drc),
+                layer['M1']
+            )
+            self.cell.add(gate_m1_shape)
+
+            # Bottom M1
+            gate_m1_shape_bottom = gdspy.Rectangle(
+                (-0.5*(min_w['CO']-self.l)-3*en['OD']['CO'],  co_bottom-3*en['PO']['CO']+offset_for_poly_co_drc),
+                (x_pos_legal2+min_w['M1']+2.5*self.gate_space,  co_bottom_top+3*en['PO']['CO']+offset_for_poly_co_drc),
+                layer['M1']
+            )
+            self.cell.add(gate_m1_shape_bottom)
+
+            gate_m2_top = gdspy.Rectangle(
+                (x_pos_legal2 + min_w['M1'] + 2.5*self.gate_space-M2_M1-(y_pos_2 - y_pos), co_top_bottom-3*en['PO']['CO']+offset_for_poly_co_drc),
+                (x_pos_legal2 + min_w['M1'] + 2.5*self.gate_space , co_top+3*en['PO']['CO']+offset_for_poly_co_drc),
+                layer['M2']
+            )
+            self.cell.add(gate_m2_top)
+
+            # ===  Bottom M2  ===
+            gate_m2_bottom = gdspy.Rectangle(
+                (x_pos_legal2 + min_w['M1'] + 2.5*self.gate_space-M2_M1-(y_pos_2 - y_pos), co_bottom-3*en['PO']['CO']+offset_for_poly_co_drc),
+                (x_pos_legal2 + min_w['M1'] + 2.5*self.gate_space , co_bottom_top+3*en['PO']['CO']+offset_for_poly_co_drc),
+                layer['M2']
+            )
+            self.cell.add(gate_m2_bottom)
+
+            # === Vert M2 connect ===
+            gate_m2_vertical = gdspy.Rectangle(
+                (x_pos_legal2 + min_w['M1'] + 2.5*self.gate_space -(y_pos_2 - y_pos), -ext_len_total + en['PO']['CO']),
+                (x_pos_legal2 + min_w['M1'] + 2.5*self.gate_space  , y_pos_2 + en['PO']['CO']),
+                layer['M2']
+            )
+            self.cell.add(gate_m2_vertical)
+
+            #via for m2-m1 in top&bottom m2
+            top_via = basic.via_double(M2_M1+(y_pos_2 - y_pos),(y_pos_2 - y_pos),2)
+            top_via = gdspy.CellReference(top_via, (x_pos_legal2 + min_w['M1'] + 2.5*self.gate_space-M2_M1-(y_pos_2 - y_pos), -ext_len_total + en['PO']['CO']),0)
+            bottom_via = basic.via_double(M2_M1+(y_pos_2 - y_pos),(y_pos_2 - y_pos),2)
+            bottom_via = gdspy.CellReference(bottom_via, (x_pos_legal2 + min_w['M1'] + 2.5*self.gate_space-M2_M1-(y_pos_2 - y_pos), y_pos + en['PO']['CO']),0)
+            self.cell.add(top_via)
+            self.cell.add(bottom_via)
+
+            print(f"Creating rectangle (gate_m1_shape top): bottom_left={(x_pos_legal1+0.5*self.gate_space, y_pos+en['PO']['CO'])}, top_right={(x_pos_legal2+min_w['M1']+2.5*self.gate_space, y_pos_2+en['PO']['CO'])}, layer={layer['M1']}")
+            print(f"Creating rectangle (gate_m1_shape bottom): bottom_left={(x_pos_legal1+0.5*self.gate_space, -ex['PO']['OD'] - ext_len_total + en['PO']['CO'])}, top_right={(x_pos_legal2+min_w['M1']+2.5*self.gate_space, -ex['PO']['OD'] - ext_len_total + en['PO']['CO'] + (y_pos_2 - y_pos))}, layer={layer['M1']}")
+
+# Adding Pin:G
+            self.gate.add_shape('M1', gate_m1_shape.get_bounding_box())
+            self.gate.add_shape('M1', gate_m1_shape_bottom.get_bounding_box())
+            print(f"Adding shape to gate: layer='M1', bottom_left={list(gate_m1_shape.get_bounding_box()[0])}, top_right={list(gate_m1_shape.get_bounding_box()[1])}")
+            print(f"Adding shape to gate: layer='M1', bottom_left={list(gate_m1_shape_bottom.get_bounding_box()[0])}, top_right={list(gate_m1_shape_bottom.get_bounding_box()[1])}")
+
+
+### Dummy Gate
+        if self.l < dummy_l:
+            dummy1_shape = gdspy.Rectangle((-self.gate_space, -(self.gate_ext_len+ 2*min_w['CO'] + sp['CO']['CO']+2*en['PO']['CO'])), (-self.gate_space+self.l, self.w+self.gate_ext_len+ 2*min_w['CO'] + sp['CO']['CO']+2*en['PO']['CO']), layer['PO'])
+            self.cell.add(dummy1_shape)
+            bbox1 = dummy1_shape.get_bounding_box()
+            print(f"dummy1_shape -> layer=PO, bottom_left={list(bbox1[0])}, top_right={list(bbox1[1])}")
+            dummy2_shape = gdspy.Rectangle((self.nf*self.gate_space, -(self.gate_ext_len+ 2*min_w['CO'] + sp['CO']['CO']+2*en['PO']['CO'])), (self.nf*self.gate_space+self.l, self.w+self.gate_ext_len+ 2*min_w['CO'] + sp['CO']['CO']+2*en['PO']['CO']), layer['PO'])
+            self.cell.add(dummy2_shape)
+            bbox2 = dummy2_shape.get_bounding_box()
+            print(f"dummy2_shape -> layer=PO, bottom_left={list(bbox2[0])}, top_right={list(bbox2[1])}")
+
+# Adding Pin:S/D
+        if self.nf == 1:
+            self.source.add_shape('M1', [[m1_array_offset, self.origin[1]], [m1_array_offset+min_w['M1'], self.w]])
+            self.drain.add_shape('M1', [[m1_array_offset+self.gate_space, self.origin[1]], [m1_array_offset+min_w['M1']+self.gate_space, self.w]])
+        #elif self.nf == 2:
+        #    self.source.add_shape('M1', m1_source_hori.get_bounding_box())
+        #    self.drain.add_shape('M1', [[m1_array_offset+self.gate_space, -2*min_w['M1']], [m1_array_offset+min_w['M1']+self.gate_space, self.w]])
+        else:
+            #self.source.add_shape('M1', m1_source_hori.get_bounding_box())
+            #if drain_count > 1:
+            #    self.drain.add_shape('M1', m1_drain_hori.get_bounding_box())
+            for i in range(self.nf+1):
+                if i % 2 == 0:
+                    coords = [[self.origin[0]+i*self.gate_space, self.origin[1]],
+                            [self.origin[0]+i*self.gate_space+min_w['M1'], self.w]]
+                    self.source.add_shape('M1', coords)
+                    print("Source M1:", coords)
+                else:
+                    coords = [[self.origin[0]+i*self.gate_space, self.origin[1]],
+                            [self.origin[0]+i*self.gate_space+min_w['M1'], self.w]]
+                    self.drain.add_shape('M1', coords)
+                    print("Drain M1:", coords)
+        #self.flatten()'''
+        self.inspect_cell(self.cell)
+        self.snapshot_with_deps(self.cell, "after_mos_core")
+
+        #202509_new=====================================================
+        #for rfmos
+        #m1-via-m2 & m2
+
+        m2_cell = basic.metal_vert(min_w['M1'], self.w,lay=2)
+        
+        m2_legal_shape = gdspy.Rectangle((0,0), (min_w['M1'], self.w), layer['M2'])
+        
+        m2_cell.add(m2_legal_shape)
+        m2_cell_space = basic.legal(self.l + min_w['CO'] + 2 * sp['CO']['PO'])
+        
+        m2_array_offset = self.l + 0.5*(m2_cell_space - self.l - min_w['M1']) - m2_cell_space
+        m2_array = gdspy.CellArray(m2_cell, (self.nf+1), 1, [m2_cell_space, 0], [m2_array_offset, 0])
+        print(f"Creating CellArray (m2_array): bottom_left=({m2_array_offset}, 0), spacing=({m2_cell_space}, 0), columns={self.nf+1}, rows=1")
+        self.cell.add(m2_array)
+
+        #connect for metal 2 & metal 3
+
+        
+        m2_square = gdspy.Cell('M2_SQUARE', True)
+        m2_sq_shape = gdspy.Rectangle(
+            (0, -KR_SP),
+            (min_w['M1'], KR_SP + min_w['SP'] + ext_len_total),  #min_w[SP] ---> min_w[SP] + ext_len_total
+            layer['M2']
+        )
+        m2_square.add(m2_sq_shape)
+        source_count = int(self.nf/2 + 1)
+        drain_count = int((self.nf+1)/2)
+       
+        m2_source = gdspy.CellArray(
+            m2_square, source_count, 1,
+            [2*self.gate_space, self.gate_space],
+            [m1_array_offset, self.w]
+        )
+        m2_drain = gdspy.CellArray(
+            m2_square, drain_count, 1,
+            [2*self.gate_space, self.gate_space],
+            [m1_array_offset+self.gate_space, -min_w['SP']+self.origin[1]-ext_len_total+min_w['M1']]
+        )
+
+        m2_source_hori = gdspy.Rectangle(
+            (m1_array_offset, self.w+KR_SP+min_w['SP']+ext_len_total), 
+            (m1_array_offset+(2*source_count-2)*self.gate_space+min_w['M1'],
+            self.w+KR_SP+min_w['SP']+C_M2+ext_len_total), 
+            layer['M2']
+        )
+        m2_drain_hori = gdspy.Rectangle(
+            (m1_array_offset+self.gate_space, self.origin[1]-min_w['SP']-C_M2-ext_len_total+min_w['M1']), 
+            (m1_array_offset+(2*drain_count-1)*self.gate_space+min_w['M1'],
+            self.origin[1]-min_w['SP']-ext_len_total+min_w['M1']),  
+            layer['M2']
+        )
+
+        self.cell.add(m2_source)
+        self.cell.add(m2_source_hori)
+        if drain_count > 1:
+            self.cell.add(m2_drain)
+            self.cell.add(m2_drain_hori)
+
+
+
+        #connection for top&bottom m1 by m2&via
+
+
+        
+        
+            
+        
+
+
+
+#========================================================================================
+
+    def nwell_gr(self):
+        if not self.nmos and NWELL_GR:
+            nwell_gr, self.bulk = basic.nwell_GR(self.cell.get_bounding_box()[0], self.cell.get_bounding_box()[1],self.origin, (1 not in self.bulkCon))    
+            #self.add_bulk_shape(nwell_gr.get_polygons(True)[(layer['M1'],0)])
+            nwell_gr_ref = gdspy.CellReference(nwell_gr)
+            self.cell.add(nwell_gr_ref)
+            #self.flatten()
+        if self.nmos and SUB_GR:
+            sub_gr, self.bulk = basic.sub_GR(self.cell.get_bounding_box()[0], self.cell.get_bounding_box()[1],self.origin, (1 not in self.bulkCon))    
+            #self.add_bulk_shape(sub_gr.get_polygons(True)[(layer['M1'],0)])
+            sub_gr_ref = gdspy.CellReference(sub_gr)
+            self.cell.add(sub_gr_ref)
+            #self.flatten()
+
+    def add_bulk_shape(self, shapes):
+        # TODO future should include all shapes
+        shape = shapes[3] # This is the vertical top strip of M1
+        self.bulk.add_shape('M2', [shape[0], shape[2]])
+        print("Bulk M2:", [list(shape[0]), list(shape[2])])
+
+    def doping_layer(self):
+        if self.nmos:
+            doping_layer = layer['NP']
+        else:
+            doping_layer = layer['PP']
+    # Define NP/PP and NW Shapes
+        if self.l < dummy_l:
+            self.dope_ll = [-self.gate_space-en['NP']['PO'], -ex['PO']['OD']-en['NP']['PO']]
+            self.dope_ur = [self.nf*self.gate_space+self.l+en['NP']['PO'], self.w+min_w['M1']+self.gate_ext_len+en['PO']['CO']-0.5*(min_w['M1']-min_w['CO'])+en['NP']['PO']] 
+            self.nw_ll = [-self.gate_space-en['PP']['PO'], -en['NW']['OD'][1]]
+            self.nw_ur = [self.nf*self.gate_space+self.l+en['PP']['PO'], self.w+en['NW']['OD'][1]] 
+        else:
+            self.dope_ll = [self.x_od1-ex['NP']['OD'], -ex['PO']['OD']-en['NP']['PO']]
+            self.dope_ur = [self.x_od2+ex['NP']['OD'], self.w+min_w['M1']+self.gate_ext_len+en['PO']['CO']-0.5*(min_w['M1']-min_w['CO'])+en['NP']['PO']]
+            self.nw_ll = [self.x_od1-en['NW']['OD'][0], -en['NW']['OD'][1]]
+            self.nw_ur = [self.x_od2+en['NW']['OD'][0], self.w+en['NW']['OD'][1]]
+        # Shrink dope due to self.nf change
+        # Draw NP/PP
+        doping_shape = gdspy.Rectangle(self.dope_ll, self.dope_ur, doping_layer)
+        print(f"Creating rectangle (doping_shape): bottom_left={self.dope_ll}, top_right={self.dope_ur}, layer={doping_layer}")
+
+        self.cell.add(doping_shape)
+        # For PMOS
+        if not self.nmos:
+            # Draw NW
+            nw_shape = gdspy.Rectangle(self.nw_ll, self.nw_ur, layer['NW'])
+            print(f"Creating rectangle (nw_shape): bottom_left={self.nw_ll}, top_right={self.nw_ur}, layer={layer['NW']}")
+
+            self.cell.add(nw_shape)
+        #self.flatten()
+
+    def print_pins(self):
+        if not (self.drain.check() and self.gate.check() and self.source.check() and self.bulk.check()):
+            print("Pin location not legal")
+        #print self.drain, self.gate, self.source, self.bulk
+
+    def flip_vert(self):
+        flip_cell = gdspy.Cell(self.cell.name, True)
+        bounding_box = self.cell.get_bounding_box()
+        x_sym_axis = bounding_box[0][0] + bounding_box[1][0]
+        # Floating point error 
+        # Since gdsii precision is 5nm, here we only round to 1nm precision
+        #x_sym_axis = round(x_sym_axis * 10000) / 10000.0
+        polydict = self.cell.get_polygons(by_spec=True)
+        for key in polydict:
+            layer, datatype = key
+            for shape in polydict[key]:
+                x_min = shape[0][0]
+                y_min = shape[0][1]
+                x_max = shape[2][0]
+                y_max = shape[2][1]
+                x_min_s = x_sym_axis - x_max
+                x_max_s = x_sym_axis - x_min
+                new_shape = gdspy.Rectangle([x_min_s,y_min], [x_max_s,y_max], layer, datatype=datatype)
+                print(f"Creating rectangle (new_shape): bottom_left=({x_min_s}, {y_min}), top_right=({x_max_s}, {y_max}), layer={layer}, datatype={datatype}")
+                flip_cell.add(new_shape)
+        self.cell = flip_cell
+        #self.flatten()
+        self.drain.flip_vert(x_sym_axis)
+        self.gate.flip_vert(x_sym_axis)
+        self.source.flip_vert(x_sym_axis)
+        self.bulk.flip_vert(x_sym_axis)
+
+    def connect_pin_bulk(self):
+        # This is only valid for device with guard ring
+        if 1 in self.bulkCon:
+            _, ll, ur = self.gate.shape[0]
+            _, _, ur_bulk = self.bulk.shape[1]
+            con1 = gdspy.Rectangle((ll[0], ur_bulk[1]-min_w['M1']),(ll[0]+min_w['M1'], ll[1]), layer['M2'])
+            print(f"Creating rectangle (con1): bottom_left=({ll[0]}, {ur_bulk[1]-min_w['M1']}), top_right=({ll[0]+min_w['M1']}, {ll[1]}), layer={layer['M2']}")
+
+            con2 = gdspy.Rectangle((ur[0]-min_w['M1'], ur_bulk[1]-min_w['M1']),(ur[0], ll[1]), layer['M2'])
+            print(f"Creating rectangle (con2): bottom_left=({ur[0]-min_w['M1']}, {ur_bulk[1]-min_w['M1']}), top_right=({ur[0]}, {ll[1]}), layer={layer['M2']}")
+
+            self.cell.add([con2])#,con2])
+        if 2 in self.bulkCon:
+            _, ll, _ = self.source.shape[0]
+            _, _, ur_bulk = self.bulk.shape[0]
+            con = gdspy.Rectangle((ll[0], ur_bulk[1]-min_w['M1']),(ll[0]+min_w['M1'], ll[1]), layer['M2'])
+            print(f"Creating rectangle (con): bottom_left=({ll[0]}, {ur_bulk[1]-min_w['M1']}), top_right=({ll[0]+min_w['M1']}, {ll[1]}), layer={layer['M2']}")
+
+            self.cell.add(con)
+        if 0 in self.bulkCon:
+            _, _, ur = self.drain.shape[0]
+            _, _, ur_bulk = self.bulk.shape[0]
+            con = gdspy.Rectangle((ur[0]-min_w['M1'], ur_bulk[1]-min_w['M1']),(ur[0], ur[1]), layer['M2'])
+            print(f"Creating rectangle (con): bottom_left=({ur[0]-min_w['M1']}, {ur_bulk[1]-min_w['M1']}), top_right=({ur[0]}, {ur[1]}), layer={layer['M2']}")
+    
+            self.cell.add(con)
+
+    def connect_pin(self, conType):
+        # conType, 0: G,S; 1: G,D; 2: S,D;
+        # special case G,D; S,B; call connect_pin then connect_pin_bulk
+        if conType in ['GS','SG']:
+            _, ll, _ = self.source.shape[0]
+            _, _, ur = self.gate.shape[0]
+            x = self.origin[0] + (self.nf / 2) * self.gate_space
+            con = gdspy.Rectangle((x, ll[1]),(x+min_w['M1'], ur[1]), layer['M2'])
+            print(f"Creating rectangle (con): bottom_left=({x}, {ll[1]}), top_right=({x+min_w['M1']}, {ur[1]}), layer={layer['M2']}")
+
+            self.cell.add(con)
+        elif conType in ['GD','DG']: 
+            _, ll, _ = self.source.shape[0]
+            _, _, ur = self.gate.shape[0]
+            x = self.origin[0] + (self.nf / 2) * self.gate_space
+            con = gdspy.Rectangle((x, ll[1]),(x+min_w['M1'], ur[1]), layer['M2'])
+            print(f"Creating rectangle (con GD/DG): bottom_left=({x}, {ll[1]}), top_right=({x+min_w['M1']}, {ur[1]}), layer={layer['M2']}")
+
+            self.cell.add(con)
+            # swap source/drain
+            tempPin = self.source
+            self.source = self.drain
+            self.drain = tempPin
+        elif conType in ['SD','DS']:
+            if self.nf == 1:
+                _, ll, _ = self.source.shape[0]
+                _, _, ur = self.drain.shape[0]
+                con1 = gdspy.Rectangle((ll[0], ll[1]),(ur[0], ll[1]+min_w['M1']), layer['M2'])
+                con2 = gdspy.Rectangle((ll[0], ur[1]-min_w['M1']),(ur[0], ur[1]), layer['M2'])
+                print(f"Creating rectangle (con1 SD/DS, nf=1): bottom_left=({ll[0]}, {ll[1]}), top_right=({ur[0]}, {ll[1]+min_w['M1']}), layer={layer['M2']}")
+                print(f"Creating rectangle (con2 SD/DS, nf=1): bottom_left=({ll[0]}, {ur[1]-min_w['M1']}), top_right=({ur[0]}, {ur[1]}), layer={layer['M2']}")
+
+                self.cell.add([con2])#,con2])
+            else:
+                _, ll, _ = self.source.shape[1]
+                _, _, ur = self.source.shape[-1]
+                con = gdspy.Rectangle((ll[0], ll[1]),(ur[0], ll[1]+min_w['M1']), layer['M2'])
+                print(f"Creating rectangle (con SD/DS, nf>1): bottom_left=({ll[0]}, {ll[1]}), top_right=({ur[0]}, {ll[1]+min_w['M1']}), layer={layer['M2']}")
+    
+                self.cell.add(con)
+
+    def bounding_box(self):
+        if self.origin:
+            assert self.origin == [0, 0], "Cell origin not reset."
+        bounding_box = self.cell.get_bounding_box()
+        ll = list(basic.legal_coord(bounding_box[0],[0,0],1))
+        ur = list(basic.legal_coord(bounding_box[1],[0,0],3))
+        ll[0] = ll[0] - min_w['M1'] - min_w['SP']
+        ll[1] = ll[1] - min_w['M1'] - min_w['SP']
+        ur[0] = ur[0] + min_w['M1'] + min_w['SP']
+        ur[1] = ur[1] + min_w['M1'] + min_w['SP']
+        return [ll,ur]
